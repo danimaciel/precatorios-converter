@@ -1,4 +1,3 @@
-
 import re
 from io import BytesIO
 
@@ -38,19 +37,68 @@ def separar_exequente_cpf(texto):
     if not texto:
         return "", ""
 
-    # Primeiro tenta achar CPF no fim da célula
     m = re.search(r"^(.*?)\s*-\s*(\d{3}\.\d{3}\.\d{3}-\d{2})", texto)
     if m:
         nome = limpar(m.group(1))
         cpf = m.group(2)
         return nome, cpf
 
-    # Fallback: separa no primeiro hífen encontrado
     partes = re.split(r"\s*-\s*", texto, maxsplit=1)
     if len(partes) == 2:
         return limpar(partes[0]), limpar(partes[1])
 
     return texto, ""
+
+
+def normalizar_valor_monetario(valor):
+    """
+    Converte valores como:
+    'R$ 12.345,67' -> 12345.67
+    '12345,67' -> 12345.67
+    """
+    texto = limpar(valor)
+
+    if not texto:
+        return None
+
+    texto = texto.replace("R$", "").replace(" ", "")
+    texto = texto.replace(".", "").replace(",", ".")
+
+    try:
+        return float(texto)
+    except ValueError:
+        return None
+
+
+def identificar_tipo_preferencia(texto_linha):
+    texto = limpar(texto_linha).upper()
+
+    # normaliza acentos principais mais comuns
+    texto = (
+        texto.replace("Ç", "C")
+        .replace("Ã", "A")
+        .replace("Á", "A")
+        .replace("À", "A")
+        .replace("Â", "A")
+        .replace("É", "E")
+        .replace("Ê", "E")
+        .replace("Í", "I")
+        .replace("Ó", "O")
+        .replace("Ô", "O")
+        .replace("Õ", "O")
+        .replace("Ú", "U")
+    )
+
+    if "DOENCA GRAVE" in texto:
+        return "Doença grave"
+    if "PESSOA COM DEFICIENCIA" in texto or "DEFICIENCIA" in texto:
+        return "Pessoa com deficiência"
+    if "IDOSO" in texto:
+        return "Idoso"
+    if "ORDEM CRONOLOGICA" in texto or "CRONOLOGICA" in texto:
+        return "Cronologia"
+
+    return None
 
 
 def carregar_linhas(arquivo):
@@ -74,10 +122,14 @@ def converter_planilha(arquivo):
         if not texto_linha:
             continue
 
-        # identifica o bloco atual
+        # identifica bloco/tipo de preferência a partir do texto da linha
+        tipo_detectado = identificar_tipo_preferencia(texto_linha)
+        if tipo_detectado:
+            bloco_atual = tipo_detectado
+            continue
+
+        # cabeçalho geral
         if "LISTA CONSOLIDADA - OFÍCIOS PRECATÓRIOS" in texto_upper:
-            m = re.search(r"\((.*?)\)", texto_linha)
-            bloco_atual = limpar(m.group(1)) if m else ""
             continue
 
         # descarta linhas que não são dados
@@ -87,8 +139,6 @@ def converter_planilha(arquivo):
             or "PODER JUDICIÁRIO" in texto_upper
             or "TRIBUNAL REGIONAL" in texto_upper
             or "SECRETARIA DE PRECATÓRIOS" in texto_upper
-            or texto_upper.startswith("PREFERÊNCIAS")
-            or texto_upper.startswith("ORDEM CRONOLÓGICA")
         ):
             continue
 
@@ -97,8 +147,7 @@ def converter_planilha(arquivo):
             continue
 
         nome, cpf = separar_exequente_cpf(vals[9] if len(vals) > 9 else "")
-
-        tipo = "Idoso" if bloco_atual.upper().startswith("PREFER") else bloco_atual
+        valor_pago = normalizar_valor_monetario(vals[14] if len(vals) > 14 else "")
 
         registros.append({
             "ORDEM DE PAGAMENTO": vals[0] if len(vals) > 0 else "",
@@ -109,8 +158,8 @@ def converter_planilha(arquivo):
             "VENCIMENTO": vals[6] if len(vals) > 6 else "",
             "EXEQUENTE": nome,
             "CPF": cpf,
-            "VALOR DEVIDO / SALDO A PAGAR POR EXEQUENTE": vals[14] if len(vals) > 14 else "",
-            "TIPO DE PREFERÊNCIA": tipo,
+            "VALOR DEVIDO / SALDO A PAGAR POR EXEQUENTE": valor_pago,
+            "TIPO DE PREFERÊNCIA": bloco_atual if bloco_atual else "Não identificado",
         })
 
     df_final = pd.DataFrame(registros, columns=COLUNAS_FINAIS)
@@ -118,7 +167,6 @@ def converter_planilha(arquivo):
     if df_final.empty:
         raise ValueError("Nenhum registro foi extraído. Verifique se o layout da planilha é o mesmo do arquivo de exemplo.")
 
-    # ordenação por ordem de pagamento
     df_final["_ord"] = pd.to_numeric(df_final["ORDEM DE PAGAMENTO"], errors="coerce")
     df_final = df_final.sort_values("_ord").drop(columns="_ord")
     df_final = df_final.drop_duplicates()
@@ -138,6 +186,13 @@ if arquivo is not None:
         output = BytesIO()
         with pd.ExcelWriter(output, engine="openpyxl") as writer:
             df_final.to_excel(writer, index=False, sheet_name="Final")
+
+            # aplica formato numérico na coluna de valor
+            ws = writer.sheets["Final"]
+            col_valor = COLUNAS_FINAIS.index("VALOR DEVIDO / SALDO A PAGAR POR EXEQUENTE") + 1
+
+            for row in range(2, len(df_final) + 2):
+                ws.cell(row=row, column=col_valor).number_format = '#,##0.00'
 
         st.download_button(
             label="Baixar planilha final",
