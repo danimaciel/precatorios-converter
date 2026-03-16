@@ -1,4 +1,5 @@
 import re
+import unicodedata
 from io import BytesIO
 
 import pandas as pd
@@ -32,15 +33,31 @@ def limpar(valor):
     return texto
 
 
+def normalizar_texto(texto):
+    texto = limpar(texto).upper()
+    texto = unicodedata.normalize("NFKD", texto)
+    texto = "".join(c for c in texto if not unicodedata.combining(c))
+    texto = re.sub(r"\s+", " ", texto).strip()
+    return texto
+
+
 def separar_exequente_cpf(texto):
     texto = limpar(texto)
     if not texto:
         return "", ""
 
+    # caso padrão: NOME - 000.000.000-00
     m = re.search(r"^(.*?)\s*-\s*(\d{3}\.\d{3}\.\d{3}-\d{2})", texto)
     if m:
         nome = limpar(m.group(1))
         cpf = m.group(2)
+        return nome, cpf
+
+    # tenta achar CPF em qualquer parte do texto
+    m2 = re.search(r"(\d{3}\.\d{3}\.\d{3}-\d{2})", texto)
+    if m2:
+        cpf = m2.group(1)
+        nome = limpar(texto.replace(cpf, "").replace(" - ", " ").replace("-", " "))
         return nome, cpf
 
     partes = re.split(r"\s*-\s*", texto, maxsplit=1)
@@ -51,11 +68,6 @@ def separar_exequente_cpf(texto):
 
 
 def normalizar_valor_monetario(valor):
-    """
-    Converte valores como:
-    'R$ 12.345,67' -> 12345.67
-    '12345,67' -> 12345.67
-    """
     texto = limpar(valor)
 
     if not texto:
@@ -70,106 +82,194 @@ def normalizar_valor_monetario(valor):
         return None
 
 
-def identificar_tipo_preferencia(texto_linha):
-    texto = limpar(texto_linha).upper()
-
-    # normaliza acentos principais mais comuns
-    texto = (
-        texto.replace("Ç", "C")
-        .replace("Ã", "A")
-        .replace("Á", "A")
-        .replace("À", "A")
-        .replace("Â", "A")
-        .replace("É", "E")
-        .replace("Ê", "E")
-        .replace("Í", "I")
-        .replace("Ó", "O")
-        .replace("Ô", "O")
-        .replace("Õ", "O")
-        .replace("Ú", "U")
-    )
-
-    if "DOENCA GRAVE" in texto:
-        return "Doença grave"
-    if "PESSOA COM DEFICIENCIA" in texto or "DEFICIENCIA" in texto:
-        return "Pessoa com deficiência"
-    if "IDOSO" in texto:
-        return "Idoso"
-    if "ORDEM CRONOLOGICA" in texto or "CRONOLOGICA" in texto:
-        return "Cronologia"
-
-    return None
-
-
 def carregar_linhas(arquivo):
     wb = load_workbook(arquivo, data_only=True)
     ws = wb.active
     return list(ws.iter_rows(values_only=True))
 
 
+def encontrar_linha_cabecalho(linhas):
+    """
+    Procura a linha que contém o cabeçalho principal da tabela.
+    """
+    for i, linha in enumerate(linhas):
+        vals = [normalizar_texto(v) for v in linha]
+
+        if (
+            "ORDEM DE PAGAMENTO" in vals
+            and "PROCESSO" in vals
+            and any("TIPO DE PREFERENCIA" in v for v in vals)
+        ):
+            return i
+
+    return None
+
+
+def construir_mapa_colunas(linha_cabecalho):
+    """
+    Cria um dicionário {NOME_NORMALIZADO_DO_CABECALHO: índice_da_coluna}
+    """
+    mapa = {}
+    for idx, valor in enumerate(linha_cabecalho):
+        chave = normalizar_texto(valor)
+        if chave:
+            mapa[chave] = idx
+    return mapa
+
+
+def localizar_coluna(mapa, nomes_exatos=None, contem=None, obrigatoria=True):
+    nomes_exatos = nomes_exatos or []
+    contem = contem or []
+
+    # tenta por nome exato
+    for nome in nomes_exatos:
+        nome_norm = normalizar_texto(nome)
+        if nome_norm in mapa:
+            return mapa[nome_norm]
+
+    # tenta por "contém"
+    for chave, idx in mapa.items():
+        for trecho in contem:
+            trecho_norm = normalizar_texto(trecho)
+            if trecho_norm in chave:
+                return idx
+
+    if obrigatoria:
+        raise ValueError(
+            f"Não foi possível localizar a coluna. Procurado por: "
+            f"{nomes_exatos if nomes_exatos else contem}"
+        )
+    return None
+
+
+def obter_valor(vals, idx):
+    if idx is None:
+        return ""
+    if idx < len(vals):
+        return vals[idx]
+    return ""
+
+
 def converter_planilha(arquivo):
     linhas = carregar_linhas(arquivo)
 
+    idx_header = encontrar_linha_cabecalho(linhas)
+    if idx_header is None:
+        raise ValueError(
+            "Não foi possível localizar o cabeçalho da planilha. "
+            "Verifique se o layout do arquivo é o esperado."
+        )
+
+    linha_cabecalho = linhas[idx_header]
+    mapa = construir_mapa_colunas(linha_cabecalho)
+
+    idx_ordem = localizar_coluna(
+        mapa,
+        nomes_exatos=["ORDEM DE PAGAMENTO"]
+    )
+    idx_momento = localizar_coluna(
+        mapa,
+        nomes_exatos=["MOMENTO DE APRESENTAÇÃO DO PRECATÓRIO"]
+    )
+    idx_processo = localizar_coluna(
+        mapa,
+        nomes_exatos=["PROCESSO"]
+    )
+    idx_precatorio = localizar_coluna(
+        mapa,
+        nomes_exatos=["PRECATÓRIO", "PRECATORIO"]
+    )
+    idx_rp = localizar_coluna(
+        mapa,
+        nomes_exatos=["RP"]
+    )
+    idx_vencimento = localizar_coluna(
+        mapa,
+        nomes_exatos=["VENCIMENTO"]
+    )
+
+    # tenta achar a coluna do exequente; como às vezes o nome varia, deixei mais flexível
+    idx_exequente_fonte = localizar_coluna(
+        mapa,
+        nomes_exatos=["EXEQUENTE"],
+        contem=["EXEQUENTE"],
+        obrigatoria=True
+    )
+
+    idx_valor = localizar_coluna(
+        mapa,
+        nomes_exatos=["VALOR DEVIDO / SALDO A PAGAR POR EXEQUENTE"],
+        contem=["SALDO A PAGAR POR EXEQUENTE", "VALOR DEVIDO"],
+        obrigatoria=True
+    )
+
+    idx_tipo_pref = localizar_coluna(
+        mapa,
+        nomes_exatos=["TIPO DE PREFERÊNCIA", "TIPO DE PREFERENCIA"],
+        contem=["TIPO DE PREFERENCIA"],
+        obrigatoria=True
+    )
+
     registros = []
-    bloco_atual = ""
 
-    for linha in linhas:
+    for i, linha in enumerate(linhas[idx_header + 1:], start=idx_header + 1):
         vals = [limpar(v) for v in linha]
-        primeira = vals[0] if len(vals) > 0 else ""
+
+        if not any(vals):
+            continue
+
+        ordem = limpar(obter_valor(vals, idx_ordem))
         texto_linha = " | ".join([v for v in vals if v])
-        texto_upper = texto_linha.upper()
+        texto_upper = normalizar_texto(texto_linha)
 
-        if not texto_linha:
-            continue
-
-        # identifica bloco/tipo de preferência a partir do texto da linha
-        tipo_detectado = identificar_tipo_preferencia(texto_linha)
-        if tipo_detectado:
-            bloco_atual = tipo_detectado
-            continue
-
-        # cabeçalho geral
-        if "LISTA CONSOLIDADA - OFÍCIOS PRECATÓRIOS" in texto_upper:
-            continue
-
-        # descarta linhas que não são dados
+        # ignora cabeçalhos repetidos ou linhas institucionais
         if (
-            primeira == "ORDEM DE PAGAMENTO"
-            or texto_upper.startswith("MUNICÍPIO DE")
-            or "PODER JUDICIÁRIO" in texto_upper
+            ordem == "ORDEM DE PAGAMENTO"
+            or "LISTA CONSOLIDADA - OFICIOS PRECATORIOS" in texto_upper
+            or texto_upper.startswith("MUNICIPIO DE")
+            or "PODER JUDICIARIO" in texto_upper
             or "TRIBUNAL REGIONAL" in texto_upper
-            or "SECRETARIA DE PRECATÓRIOS" in texto_upper
+            or "SECRETARIA DE PRECATORIOS" in texto_upper
         ):
             continue
 
-        # só entra se a primeira célula for a ordem de pagamento
-        if not primeira.isdigit():
+        # só considera linhas que começam por número da ordem
+        if not re.fullmatch(r"\d+", ordem):
             continue
 
-        nome, cpf = separar_exequente_cpf(vals[9] if len(vals) > 9 else "")
-        valor_pago = normalizar_valor_monetario(vals[14] if len(vals) > 14 else "")
+        exequente_fonte = obter_valor(vals, idx_exequente_fonte)
+        nome, cpf = separar_exequente_cpf(exequente_fonte)
+
+        valor_pago = normalizar_valor_monetario(obter_valor(vals, idx_valor))
+        tipo_preferencia = limpar(obter_valor(vals, idx_tipo_pref))
 
         registros.append({
-            "ORDEM DE PAGAMENTO": vals[0] if len(vals) > 0 else "",
-            "MOMENTO DE APRESENTAÇÃO DO PRECATÓRIO": vals[1] if len(vals) > 1 else "",
-            "PROCESSO": vals[2] if len(vals) > 2 else "",
-            "PRECATÓRIO": vals[3] if len(vals) > 3 else "",
-            "RP": vals[4] if len(vals) > 4 else "",
-            "VENCIMENTO": vals[6] if len(vals) > 6 else "",
+            "_linha_original": i,
+            "ORDEM DE PAGAMENTO": ordem,
+            "MOMENTO DE APRESENTAÇÃO DO PRECATÓRIO": obter_valor(vals, idx_momento),
+            "PROCESSO": obter_valor(vals, idx_processo),
+            "PRECATÓRIO": obter_valor(vals, idx_precatorio),
+            "RP": obter_valor(vals, idx_rp),
+            "VENCIMENTO": obter_valor(vals, idx_vencimento),
             "EXEQUENTE": nome,
             "CPF": cpf,
             "VALOR DEVIDO / SALDO A PAGAR POR EXEQUENTE": valor_pago,
-            "TIPO DE PREFERÊNCIA": bloco_atual if bloco_atual else "Não identificado",
+            "TIPO DE PREFERÊNCIA": tipo_preferencia,
         })
 
-    df_final = pd.DataFrame(registros, columns=COLUNAS_FINAIS)
+    df_final = pd.DataFrame(registros)
 
     if df_final.empty:
-        raise ValueError("Nenhum registro foi extraído. Verifique se o layout da planilha é o mesmo do arquivo de exemplo.")
+        raise ValueError(
+            "Nenhum registro foi extraído. Verifique se o layout da planilha é o mesmo do arquivo esperado."
+        )
 
-    df_final["_ord"] = pd.to_numeric(df_final["ORDEM DE PAGAMENTO"], errors="coerce")
-    df_final = df_final.sort_values("_ord").drop(columns="_ord")
-    df_final = df_final.drop_duplicates()
+    # preserva a ordem original da planilha
+    df_final = df_final.sort_values("_linha_original", kind="mergesort")
+    df_final = df_final.drop(columns="_linha_original")
+
+    # garante a ordem final das colunas
+    df_final = df_final[COLUNAS_FINAIS]
 
     return df_final
 
@@ -187,10 +287,10 @@ if arquivo is not None:
         with pd.ExcelWriter(output, engine="openpyxl") as writer:
             df_final.to_excel(writer, index=False, sheet_name="Final")
 
-            # aplica formato numérico na coluna de valor
             ws = writer.sheets["Final"]
-            col_valor = COLUNAS_FINAIS.index("VALOR DEVIDO / SALDO A PAGAR POR EXEQUENTE") + 1
 
+            # aplica formato numérico na coluna de valor
+            col_valor = COLUNAS_FINAIS.index("VALOR DEVIDO / SALDO A PAGAR POR EXEQUENTE") + 1
             for row in range(2, len(df_final) + 2):
                 ws.cell(row=row, column=col_valor).number_format = '#,##0.00'
 
