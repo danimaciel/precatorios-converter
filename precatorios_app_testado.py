@@ -188,7 +188,6 @@ def converter_planilha(arquivo):
         nomes_exatos=["VENCIMENTO"]
     )
 
-    # tenta achar a coluna do exequente; como às vezes o nome varia, deixei mais flexível
     idx_exequente_fonte = localizar_coluna(
         mapa,
         nomes_exatos=["EXEQUENTE"],
@@ -212,19 +211,31 @@ def converter_planilha(arquivo):
 
     registros = []
 
+    # guarda os últimos valores válidos das colunas que costumam vir mescladas
+    ultimos_compartilhados = {
+        "ordem": "",
+        "momento": "",
+        "processo": "",
+        "precatorio": "",
+        "rp": "",
+        "vencimento": "",
+        "tipo_pref": "",
+    }
+
     for i, linha in enumerate(linhas[idx_header + 1:], start=idx_header + 1):
         vals = [limpar(v) for v in linha]
 
         if not any(vals):
             continue
 
-        ordem = limpar(obter_valor(vals, idx_ordem))
         texto_linha = " | ".join([v for v in vals if v])
         texto_upper = normalizar_texto(texto_linha)
 
+        ordem_bruta = limpar(obter_valor(vals, idx_ordem))
+
         # ignora cabeçalhos repetidos ou linhas institucionais
         if (
-            ordem == "ORDEM DE PAGAMENTO"
+            ordem_bruta == "ORDEM DE PAGAMENTO"
             or "LISTA CONSOLIDADA - OFICIOS PRECATORIOS" in texto_upper
             or texto_upper.startswith("MUNICIPIO DE")
             or "PODER JUDICIARIO" in texto_upper
@@ -233,24 +244,71 @@ def converter_planilha(arquivo):
         ):
             continue
 
-        # só considera linhas que começam por número da ordem
-        if not re.fullmatch(r"\d+", ordem):
+        # lê os valores da linha
+        momento = limpar(obter_valor(vals, idx_momento))
+        processo = limpar(obter_valor(vals, idx_processo))
+        precatorio = limpar(obter_valor(vals, idx_precatorio))
+        rp = limpar(obter_valor(vals, idx_rp))
+        vencimento = limpar(obter_valor(vals, idx_vencimento))
+        tipo_preferencia = limpar(obter_valor(vals, idx_tipo_pref))
+        exequente_fonte = limpar(obter_valor(vals, idx_exequente_fonte))
+        valor_bruto = obter_valor(vals, idx_valor)
+
+        # preenche campos compartilhados quando vierem vazios por causa de célula mesclada
+        if ordem_bruta:
+            ultimos_compartilhados["ordem"] = ordem_bruta
+        else:
+            ordem_bruta = ultimos_compartilhados["ordem"]
+
+        if momento:
+            ultimos_compartilhados["momento"] = momento
+        else:
+            momento = ultimos_compartilhados["momento"]
+
+        if processo:
+            ultimos_compartilhados["processo"] = processo
+        else:
+            processo = ultimos_compartilhados["processo"]
+
+        if precatorio:
+            ultimos_compartilhados["precatorio"] = precatorio
+        else:
+            precatorio = ultimos_compartilhados["precatorio"]
+
+        if rp:
+            ultimos_compartilhados["rp"] = rp
+        else:
+            rp = ultimos_compartilhados["rp"]
+
+        if vencimento:
+            ultimos_compartilhados["vencimento"] = vencimento
+        else:
+            vencimento = ultimos_compartilhados["vencimento"]
+
+        if tipo_preferencia:
+            ultimos_compartilhados["tipo_pref"] = tipo_preferencia
+        else:
+            tipo_preferencia = ultimos_compartilhados["tipo_pref"]
+
+        # só considera linhas que tenham ordem válida após o preenchimento
+        if not re.fullmatch(r"\d+", ordem_bruta):
             continue
 
-        exequente_fonte = obter_valor(vals, idx_exequente_fonte)
-        nome, cpf = separar_exequente_cpf(exequente_fonte)
+        # só considera linhas que tenham um exequente
+        if not exequente_fonte:
+            continue
 
-        valor_pago = normalizar_valor_monetario(obter_valor(vals, idx_valor))
-        tipo_preferencia = limpar(obter_valor(vals, idx_tipo_pref))
+        nome, cpf = separar_exequente_cpf(exequente_fonte)
+        valor_pago = normalizar_valor_monetario(valor_bruto)
 
         registros.append({
             "_linha_original": i,
-            "ORDEM DE PAGAMENTO": ordem,
-            "MOMENTO DE APRESENTAÇÃO DO PRECATÓRIO": obter_valor(vals, idx_momento),
-            "PROCESSO": obter_valor(vals, idx_processo),
-            "PRECATÓRIO": obter_valor(vals, idx_precatorio),
-            "RP": obter_valor(vals, idx_rp),
-            "VENCIMENTO": obter_valor(vals, idx_vencimento),
+            "ORDEM DE PAGAMENTO": ordem_bruta,
+            "MOMENTO DE APRESENTAÇÃO DO PRECATÓRIO": momento,
+            "PROCESSO": processo,
+            "PRECATÓRIO": precatorio,
+            "RP": rp,
+            "VENCIMENTO": vencimento,
             "EXEQUENTE": nome,
             "CPF": cpf,
             "VALOR DEVIDO / SALDO A PAGAR POR EXEQUENTE": valor_pago,
@@ -289,7 +347,7 @@ if arquivo is not None:
 
             ws = writer.sheets["Final"]
 
-            # aplica formato numérico na coluna de valor
+            # aplica formato numérico na coluna de valor, sem símbolo R$
             col_valor = COLUNAS_FINAIS.index("VALOR DEVIDO / SALDO A PAGAR POR EXEQUENTE") + 1
             for row in range(2, len(df_final) + 2):
                 ws.cell(row=row, column=col_valor).number_format = '#,##0.00'
